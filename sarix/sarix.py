@@ -65,7 +65,7 @@ class SARProcess(Distribution):
             no additional noise is added to the process evolution past this point
         """
         assert (
-            isinstance(num_steps, int) and num_steps > 0
+            num_steps > 0
         ), "`num_steps` argument should be an positive integer."
         assert (
             len(theta) == 3 * (p + P * (p + 1))
@@ -89,6 +89,10 @@ class SARProcess(Distribution):
                     [theta[:n_ar_coef].reshape(n_ar_coef, 1), jnp.zeros((n_ar_coef, 1))],
                     axis = 0),
                 theta[n_ar_coef:].reshape(2 * n_ar_coef, 1)
+                # jnp.concatenate(
+                #     [jnp.tanh(theta[:n_ar_coef].reshape(n_ar_coef, 1)), jnp.zeros((n_ar_coef, 1))],
+                #     axis = 0),
+                # jnp.tanh(theta[n_ar_coef:].reshape(2 * n_ar_coef, 1))
             ],
             axis = 1)
         super(SARProcess, self).__init__(
@@ -215,7 +219,7 @@ class SARIX():
         if transform == "sqrt":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.sqrt(self.xy)
-        elif transform == "quarter":
+        elif transform == "fourth_rt":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.power(self.xy, 0.25)
         elif transform == "log":
@@ -229,7 +233,7 @@ class SARIX():
         # undo transformation to get predictions on original scale
         if transform == "log":
             self.predictions_orig = onp.exp(self.samples['xy_future'])
-        elif transform == "quarter":
+        elif transform == "fourth_rt":
             self.predictions_orig = jnp.maximum(0.0, self.samples['xy_future'])**4
         elif transform == "sqrt":
             self.predictions_orig = jnp.maximum(0.0, self.samples['xy_future'])**2

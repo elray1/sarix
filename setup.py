@@ -8,7 +8,7 @@ setup(name='sarix',
     author='Evan L. Ray',
     author_email='elray@umass.edu',
     url='https://github.com/elray1/sarix',
-    packages=['stlpred'],
+    packages=['sarix'],
     install_requires=[
         'numpy',
         'matplotlib',
