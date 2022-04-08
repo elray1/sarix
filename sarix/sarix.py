@@ -3,11 +3,8 @@ Local Trend
 ================
 """
 
-import argparse
 import os
 import time
-
-import pickle
 
 from functools import reduce
 
@@ -43,6 +40,7 @@ class SARProcess(Distribution):
     reparametrized_params = []
 
     def __init__(self,
+                 n_x=0,
                  p=1,
                  P=0,
                  season_period=7,
@@ -50,71 +48,87 @@ class SARProcess(Distribution):
                  theta=jnp.array([1.0]),
                  noise_distribution=dist.MultivariateNormal(loc=jnp.zeros((1,)), covariance_matrix=jnp.eye(1)),
                  num_steps=1,
-                 freeze_steps=0,
                  validate_args=None):
         """
-        init_state: the value of the state at time 0. an array of shape (batch_shape, num_states, 1)
-        A: state transition matrices, with shape (batch_shape, num_states, num_states).
-            the state at time t, X_t, is computed as X_t = np.matmul(A, X_{t-1}) + epsilon_t
-        noise_distribution: distribution for state transition noise. The state at time t, X_t,
-            is computed as X_t = np.matmul(A, X_{t-1}) + epsilon_t, where
-            epsilon_t ~ noise_distribution
+        Parameters
+        ----------
+        n_x: integer number of x covariates
+        p: integer number of non-seasonal lags to include
+        P: integer number of seasonal lags to include
+        season_period: integer length of seasonal period; e.g., 7 for weekly data
+        init_state: the value of the state at time 0. an array of shape (batch_shape, n_states, 1)
+        theta: parameter vector of length (1 + 2*n_x) * (p + P * (p + 1))
+        noise_distribution: distribution for state transition noise, with event shape `n_x + 1`.
+            The state at time t, X_t, is computed as X_t = np.matmul(A, X_{t-1}) + epsilon_t,
+            where epsilon_t ~ noise_distribution
         num_steps: number of steps the process iterates for.  If num_steps is 1, all values will
             be the value of the initial state
-        freeze_steps: number of steps at the end of the process for which we should freeze dynamics;
-            no additional noise is added to the process evolution past this point
         """
         assert (
             num_steps > 0
         ), "`num_steps` argument should be an positive integer."
         assert (
-            len(theta) == 3 * (p + P * (p + 1))
-        ), "`theta` argument should have length 3 * (p + P * (p + 1))"
+            len(theta) == (1 + 2 * n_x) * (p + P * (p + 1))
+        ), "`theta` argument should have length (1 + 2 * n_x) * (p + P * (p + 1))"
+        self.n_x = n_x
+        self.num_states = n_x + 1
+        
         self.p = p
         self.P = P
         self.season_period = season_period
         self.max_lag = p + P * season_period
+        
         self.init_state = init_state
+        
         self.noise_distribution = noise_distribution
-        self.num_states = 2
-        # self.num_states = self.noise_distribution.event_shape[0]
-        # self.init_state = init_state
+        
         self.theta = theta
+        
         self.num_steps = num_steps
+        
         batch_shape, event_shape = (), (num_steps, self.num_states)
-        n_ar_coef = (p + P * (p + 1))
-        self.A = jnp.concatenate(
-            [
-                jnp.concatenate(
-                    [theta[:n_ar_coef].reshape(n_ar_coef, 1), jnp.zeros((n_ar_coef, 1))],
-                    axis = 0),
-                theta[n_ar_coef:].reshape(2 * n_ar_coef, 1)
-                # jnp.concatenate(
-                #     [jnp.tanh(theta[:n_ar_coef].reshape(n_ar_coef, 1)), jnp.zeros((n_ar_coef, 1))],
-                #     axis = 0),
-                # jnp.tanh(theta[n_ar_coef:].reshape(2 * n_ar_coef, 1))
-            ],
-            axis = 1)
+        
+        # assemble state transition matrix A
+        n_ar_coef = p + P * (p + 1)
+        A_x_cols = [
+            jnp.concatenate(
+                    [
+                        jnp.zeros((i * n_ar_coef, 1)),
+                        theta[(i * n_ar_coef):((i + 1) * n_ar_coef)].reshape(n_ar_coef, 1),
+                        jnp.zeros(((n_x - i) * n_ar_coef, 1))
+                    ],
+                    axis = 0) \
+                for i in range(n_x)
+        ]
+        A_y_col = [ theta[(n_x * n_ar_coef):].reshape((1 + n_x) * n_ar_coef, 1) ]
+        self.A = jnp.concatenate(A_x_cols + A_y_col, axis = 1)
+        
         super(SARProcess, self).__init__(
             batch_shape, event_shape, validate_args=validate_args
         )
 
     @validate_sample
     def log_prob(self, value):
-        # step means are np.matmul(A, states) for states before time t,
+        # step means are np.matmul(X, A) for states before time t,
         # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
         update_X = self.state_update_X(self.init_state, value)
         step_means = jnp.matmul(
             update_X,
             self.A
         )
-        assert(step_means.shape == (self.num_steps, 2))
+        assert(step_means.shape == (self.num_steps, self.n_x + 1))
         # step innovations are (state - step_means),
         # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
         # step_innovations = value[..., 1:] - step_means
         step_innovations = value - step_means
-        step_probs = self.noise_distribution.log_prob(
-            step_innovations[..., :self.noise_distribution.event_shape[0]])
+        # print('value.shape')
+        # print(value.shape)
+        # print('step_means.shape')
+        # print(step_means.shape)
+        # print('step_innovations.shape')
+        # print(step_innovations.shape)
+        step_probs = self.noise_distribution.log_prob(step_innovations)
+            # step_innovations[..., :self.noise_distribution.event_shape[0]])
         return jnp.sum(step_probs, axis=-1)
     
     
@@ -122,13 +136,16 @@ class SARProcess(Distribution):
         stoch_state = jnp.concatenate([init_stoch_state, stoch_state], axis=0)
         
         # lagged values of x
-        lagged_x = self.build_lagged_var(stoch_state[:, 0:1])
+        lagged_x = [
+            self.build_lagged_var(stoch_state[:, i:(i+1)]) \
+                for i in range(self.n_x)
+        ]
         
         # lagged values of y
-        lagged_y = self.build_lagged_var(stoch_state[:, 1:2])
+        lagged_y = self.build_lagged_var(stoch_state[:, self.n_x:(self.n_x + 1)])
         
         # concatenate
-        return jnp.concatenate([lagged_x, lagged_y], axis = 1)
+        return jnp.concatenate(lagged_x + [lagged_y], axis = 1)
     
     
     def build_lagged_var(self, x):
@@ -140,10 +157,6 @@ class SARProcess(Distribution):
         lagged_state = [x for x in lagged_state if x is not None]
         lagged_state = jnp.concatenate(lagged_state, axis = 1)
         
-        # state_update_X = jnp.concatenate(
-        #     [stoch_state, lagged_state],
-        #     axis=0
-        # )
         # return entries in rows starting at the last row of init_stoch_shape,
         # going up to second-to-last column. These are the entries used to determine
         # means for stoch_state
@@ -204,6 +217,7 @@ class SARIX():
                  transform,
                  forecast_horizon,
                  num_warmup, num_samples, num_chains):
+        self.n_x = xy.shape[1] - 1
         self.xy = xy
         self.p = p
         self.P = P
@@ -258,7 +272,7 @@ class SARIX():
     
     def model(self, xy):
         ## Vector of variances for each of the 2 state variables
-        ar_update_sd = numpyro.sample("betas_update_var", dist.HalfCauchy(jnp.ones(2)))
+        ar_update_sd = numpyro.sample("betas_update_var", dist.HalfCauchy(jnp.ones(self.n_x + 1)))
 
         ## Lower cholesky factor of the covariance matrix
         ## we can also use a faster formula `Sigma_eta_chol = sigma[..., None] * L_sigma_eta`
@@ -266,7 +280,7 @@ class SARIX():
         Sigma_ar_update_chol = jnp.diag(ar_update_sd)
 
         # state transition matrix parameters
-        n_theta = 3 * (self.p + self.P * (self.p + 1))
+        n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
         theta_sd = numpyro.sample(
             "theta_sd",
             dist.HalfCauchy(jnp.ones(1))
@@ -280,15 +294,15 @@ class SARIX():
         betas = numpyro.sample(
             "xy",
             SARProcess(
+                n_x=self.n_x,
                 p=self.p,
                 P=self.P,
                 season_period=7,
                 init_state=xy[:max_lag, :],
                 theta=theta,
                 noise_distribution=dist.MultivariateNormal(
-                    loc=jnp.zeros((2,)), scale_tril=Sigma_ar_update_chol),
-                num_steps=xy.shape[0] - max_lag,
-                freeze_steps=0
+                    loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
+                num_steps=xy.shape[0] - max_lag
             ),
             obs = xy[max_lag:, :]
         )
@@ -297,15 +311,15 @@ class SARIX():
         numpyro.sample(
             "xy_future",
             SARProcess(
+                n_x=self.n_x,
                 p=self.p,
                 P=self.P,
                 season_period=7,
                 init_state=xy[-max_lag:, :],
                 theta=theta,
                 noise_distribution=dist.MultivariateNormal(
-                    loc=jnp.zeros((2,)), scale_tril=Sigma_ar_update_chol),
-                num_steps=self.forecast_horizon,
-                freeze_steps=0
+                    loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
+                num_steps=self.forecast_horizon
             )
         )
 
