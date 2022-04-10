@@ -32,6 +32,114 @@ import datetime
 import covidcast
 
 
+def diff(x, d=0, D=0, season_period=7, pad_na=False):
+    """
+    Apply differencing and seasonal differencing to all variables in a
+    batch of matrices with observations in rows and variables in columns.
+    
+    Parameters
+    ----------
+    x: a numpy array to difference, with shape `batch_shape + (T, n_vars)`
+    d: number of ordinary differences to compute
+    D: number of seasonal differences to compute
+    seasonal_period: number of time points per seasonal period
+    pad_na: boolean; if True, result has shape `batch_shape + (T, n_vars)` and
+        the leading D + d rows in axis -2 have values `np.nan`. Otherwise, the
+        result has shape `batch_shape + (T - D - d, n_vars)`.
+    
+    Returns
+    -------
+    a copy of x after taking differences
+    """
+    # non-seasonal differencing
+    x = onp.diff(x, n = d, axis = -2)
+    
+    # seasonal differencing
+    for i in range(D):
+        x = x[..., season_period:, :] - x[..., :-season_period, :]
+    
+    if pad_na:
+        batch_shape = x.shape[:-2]
+        n_vars = x.shape[-1]
+        leading_nans = onp.full(batch_shape + (D * season_period + d, n_vars), onp.nan)
+        x = onp.concatenate([leading_nans, x], axis = -2)
+    
+    return x
+
+
+def inv_diff(x, dx, d=0, D=0, season_period=7):
+    '''
+    Invert ordinary and seasonal differencing (go from seasonally differenced
+    time series to original time series).
+    
+    Inputs
+    ------
+    dx a (batch of) first-order and/or seasonally differenced time series
+        with shape `batch_size_dx + (T_dx, n_vars)`. For example, if d=0, D=1,
+        `dx` has values like `x_{t} - x_{t - season_period}`.
+    x a (batch of) time series with shape `batch_size_x + (T_x, n_vars)`.
+    d order of first differencing
+    D order of seasonal differencing
+    seasonal_period: number of time points per seasonal period
+    
+    Returns
+    -------
+    an array with the same shape as `dx` containing reconstructed values of
+    the original time series `x` in the time points `T_x, ..., T_x + T_dx - 1`
+    (with zero-based indexing so that x covers the time points `0, ..., T_x - 1`)
+    
+    Notes
+    -----
+    It is assumed that dx "starts" one time index after x "ends": that is, if
+        d = 0 and D = 1 then if we had observed x[..., T_x, :] we could calculate
+        dx[..., 0, :] = x[..., T_x, :] - x[..., T - ts_frequency, :]
+    '''
+    # record information about shapes
+    batch_shape_x = x.shape[:-2]
+    T_x = x.shape[-2]
+    n_vars = x.shape[-1]
+    batch_shape_dx = dx.shape[:-2]
+    T_dx = dx.shape[-2]
+    
+    # validate shapes
+    if dx.shape[-1] != n_vars:
+        raise ValueError("x and dx must have the same size in their last dimension")
+    
+    try:
+        broadcast_batch_shape = jnp.broadcast_shapes(batch_shape_x, batch_shape_dx)
+        if broadcast_batch_shape != batch_shape_dx:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("The batch shapes of x and dx must be broadcastable to the batch shape of dx")
+    
+    if T_x < d + D:
+        raise ValueError("There must be at least d + D observed values in x to invert differencing")
+    
+    # invert ordinary differencing
+    for i in range(1, d + 1):
+        x_dm1 = diff(x, d=d-i, D=D, season_period=season_period, pad_na=True)
+
+        x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
+        dx_full = onp.concatenate([x_dm1, dx], axis=-2)
+        for t in range(T_dx):
+            dx_full[..., T_x + t, :] = dx_full[..., T_x + t - 1, :] + dx_full[..., T_x + t, :]
+        
+        dx = dx_full[..., -T_dx:, :]
+    
+    # invert seasonal differencing
+    for i in range(1, D + 1):
+        x_dm1 = diff(x, d=0, D=D-i, season_period=season_period, pad_na=True)
+
+        x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
+        dx_full = onp.concatenate([x_dm1, dx], axis=-2)
+        for t in range(T_dx):
+            dx_full[..., T_x + t, :] = dx_full[..., T_x + t - season_period, :] + dx_full[..., T_x + t, :]
+        
+        dx = dx_full[..., -T_dx:, :]
+    
+    return dx
+
+
 class SARProcess(Distribution):
     # arg_constraints = {"scale": constraints.positive}
     arg_constraints = {}
@@ -212,7 +320,9 @@ class SARIX():
     def __init__(self,
                  xy,
                  p,
+                 d,
                  P,
+                 D,
                  season_period,
                  transform,
                  forecast_horizon,
@@ -220,7 +330,9 @@ class SARIX():
         self.n_x = xy.shape[1] - 1
         self.xy = xy
         self.p = p
+        self.d = d
         self.P = P
+        self.D = D
         self.transform = transform
         self.season_period = season_period
         self.forecast_horizon = forecast_horizon
@@ -239,20 +351,26 @@ class SARIX():
         elif transform == "log":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.log(self.xy)
+        
+        # do differencing
+        transformed_xy = self.xy
+        self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
 
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
         self.run_inference(rng_key)
 
+        # undo differencing
+        self.predictions_orig = inv_diff(transformed_xy, self.samples['xy_future'],
+                                         self.d, self.D, self.season_period)
+
         # undo transformation to get predictions on original scale
         if transform == "log":
-            self.predictions_orig = onp.exp(self.samples['xy_future'])
+            self.predictions_orig = onp.exp(self.predictions_orig)
         elif transform == "fourth_rt":
-            self.predictions_orig = jnp.maximum(0.0, self.samples['xy_future'])**4
+            self.predictions_orig = jnp.maximum(0.0, self.predictions_orig)**4
         elif transform == "sqrt":
-            self.predictions_orig = jnp.maximum(0.0, self.samples['xy_future'])**2
-        else:
-            self.predictions_orig = self.samples['xy_future']
+            self.predictions_orig = jnp.maximum(0.0, self.predictions_orig)**2
         
     
 
@@ -290,14 +408,14 @@ class SARIX():
             dist.Normal(loc=jnp.zeros(n_theta), scale=jnp.full((n_theta,), theta_sd))
         )
 
-        max_lag = self.p + self.P * 7
+        max_lag = self.p + self.P * self.season_period
         betas = numpyro.sample(
             "xy",
             SARProcess(
                 n_x=self.n_x,
                 p=self.p,
                 P=self.P,
-                season_period=7,
+                season_period=self.season_period,
                 init_state=xy[:max_lag, :],
                 theta=theta,
                 noise_distribution=dist.MultivariateNormal(
@@ -314,7 +432,7 @@ class SARIX():
                 n_x=self.n_x,
                 p=self.p,
                 P=self.P,
-                season_period=7,
+                season_period=self.season_period,
                 init_state=xy[-max_lag:, :],
                 theta=theta,
                 noise_distribution=dist.MultivariateNormal(
