@@ -75,9 +75,9 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     Inputs
     ------
     dx a (batch of) first-order and/or seasonally differenced time series
-        with shape `batch_size_dx + (T_dx, n_vars)`. For example, if d=0, D=1,
+        with shape `batch_shape_dx + (T_dx, n_vars)`. For example, if d=0, D=1,
         `dx` has values like `x_{t} - x_{t - season_period}`.
-    x a (batch of) time series with shape `batch_size_x + (T_x, n_vars)`.
+    x a (batch of) time series with shape `batch_shape_x + (T_x, n_vars)`.
     d order of first differencing
     D order of seasonal differencing
     seasonal_period: number of time points per seasonal period
@@ -129,7 +129,7 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     # invert seasonal differencing
     for i in range(1, D + 1):
         x_dm1 = diff(x, d=0, D=D-i, season_period=season_period, pad_na=True)
-
+        
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
         dx_full = onp.concatenate([x_dm1, dx], axis=-2)
         for t in range(T_dx):
@@ -153,6 +153,7 @@ class SARProcess(Distribution):
                  P=0,
                  season_period=7,
                  init_state=jnp.array([[[0.0]]]),
+                 update_X=jnp.array([[1.0]]),
                  theta=jnp.array([1.0]),
                  noise_distribution=dist.MultivariateNormal(loc=jnp.zeros((1,)), covariance_matrix=jnp.eye(1)),
                  num_steps=1,
@@ -187,6 +188,7 @@ class SARProcess(Distribution):
         self.max_lag = p + P * season_period
         
         self.init_state = init_state
+        self.update_X = update_X
         
         self.noise_distribution = noise_distribution
         
@@ -214,12 +216,14 @@ class SARProcess(Distribution):
         super(SARProcess, self).__init__(
             batch_shape, event_shape, validate_args=validate_args
         )
-
+    
+    
     @validate_sample
     def log_prob(self, value):
         # step means are np.matmul(X, A) for states before time t,
         # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
-        update_X = self.state_update_X(self.init_state, value)
+        # update_X = self.state_update_X(self.init_state, value)
+        update_X = self.update_X
         step_means = jnp.matmul(
             update_X,
             self.A
@@ -229,90 +233,17 @@ class SARProcess(Distribution):
         # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
         # step_innovations = value[..., 1:] - step_means
         step_innovations = value - step_means
-        # print('value.shape')
-        # print(value.shape)
-        # print('step_means.shape')
-        # print(step_means.shape)
-        # print('step_innovations.shape')
-        # print(step_innovations.shape)
         step_probs = self.noise_distribution.log_prob(step_innovations)
-            # step_innovations[..., :self.noise_distribution.event_shape[0]])
         return jnp.sum(step_probs, axis=-1)
     
     
-    def state_update_X(self, init_stoch_state, stoch_state):
-        stoch_state = jnp.concatenate([init_stoch_state, stoch_state], axis=0)
-        
-        # lagged values of x
-        lagged_x = [
-            self.build_lagged_var(stoch_state[:, i:(i+1)]) \
-                for i in range(self.n_x)
-        ]
-        
-        # lagged values of y
-        lagged_y = self.build_lagged_var(stoch_state[:, self.n_x:(self.n_x + 1)])
-        
-        # concatenate
-        return jnp.concatenate(lagged_x + [lagged_y], axis = 1)
-    
-    
-    def build_lagged_var(self, x):
-        # lagged state, highest degree term
-        lagged_state = [
-            self.lagged_vals_one_seasonal_lag(x=x,
-                                              seasonal_lag=P_ind*self.season_period,
-                                              p=self.p) for P_ind in range(self.P+1)]
-        lagged_state = [x for x in lagged_state if x is not None]
-        lagged_state = jnp.concatenate(lagged_state, axis = 1)
-        
-        # return entries in rows starting at the last row of init_stoch_shape,
-        # going up to second-to-last column. These are the entries used to determine
-        # means for stoch_state
-        # return state_update_X[..., (init_stoch_state.shape[-1] - 1):(-1)]
-        return lagged_state[(self.max_lag - 1):(-1), :]
-    
-    
-    def lagged_vals_one_seasonal_lag(self, x, seasonal_lag, p):
-        if seasonal_lag == 0:
-            # no seasonal lag, just terms up to p
-            to_concat = [self.lagged_col(x, l) for l in range(p)]
-        else:
-            # lags from seasonal_lag to (seasonal_lag + p)
-            to_concat = [self.lagged_col(x, seasonal_lag - 1 + l) for l in range(p+1)]
-
-        if to_concat == []:
-            return None
-        
-        result = jnp.concatenate(to_concat, axis=1)
-        return result
-    
-    
-    def lagged_col(self, x, lag):
-        T = x.shape[0]
-        return jnp.concatenate(
-            [jnp.full((lag, 1), jnp.nan), x[:(T-lag), 0:1]],
-            axis=0)
-
-
-    # @property
-    # def mean(self):
-    #     return np.zeros(self.batch_shape + self.event_shape)
-
-    # @property
-    # def variance(self):
-    #     return jnp.broadcast_to(
-    #         jnp.expand_dims(self.scale, -1) ** 2 * jnp.arange(1, self.num_steps + 1),
-    #         self.batch_shape + self.event_shape,
-    #     )
-
     def tree_flatten(self):
         return (self.scale,), self.num_steps
-
+    
+    
     @classmethod
     def tree_unflatten(cls, aux_data, params):
         return cls(*params, num_steps=aux_data)
-
-
 
 
 
@@ -328,52 +259,61 @@ class SARIX():
                  forecast_horizon,
                  num_warmup, num_samples, num_chains):
         self.n_x = xy.shape[1] - 1
-        self.xy = xy
+        self.xy = xy.copy()
         self.p = p
         self.d = d
         self.P = P
         self.D = D
+        self.max_lag = p + P * season_period
         self.transform = transform
         self.season_period = season_period
         self.forecast_horizon = forecast_horizon
         self.num_warmup = num_warmup
         self.num_samples = num_samples
         self.num_chains = num_chains
-
+        
         # do transformation
         self.xy_orig = xy.copy()
         if transform == "sqrt":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.sqrt(self.xy)
-        elif transform == "fourth_rt":
+        elif transform == "fourthrt":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.power(self.xy, 0.25)
         elif transform == "log":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.log(self.xy)
         
-        # do differencing
+        # do differencing; save xy before differencing for later use when
+        # inverting differencing
         transformed_xy = self.xy
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
-
+        
+        # pre-calculate state update matrix
+        self.update_X = self.state_update_X(self.xy[:self.max_lag, :],
+                                            self.xy[self.max_lag:, :])
+        
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
         self.run_inference(rng_key)
-
+        
+        # generate predictions
+        self.predictions_modeled_scale = self.predict(rng_key_predict)
+        
         # undo differencing
-        self.predictions_orig = inv_diff(transformed_xy, self.samples['xy_future'],
-                                         self.d, self.D, self.season_period)
-
+        self.predictions = inv_diff(transformed_xy,
+                                    self.predictions_modeled_scale,
+                                    self.d, self.D, self.season_period)
+        
         # undo transformation to get predictions on original scale
         if transform == "log":
-            self.predictions_orig = onp.exp(self.predictions_orig)
-        elif transform == "fourth_rt":
-            self.predictions_orig = jnp.maximum(0.0, self.predictions_orig)**4
+            self.predictions = onp.exp(self.predictions)
+        elif transform == "fourthrt":
+            self.predictions = jnp.maximum(0.0, self.predictions)**4
         elif transform == "sqrt":
-            self.predictions_orig = jnp.maximum(0.0, self.predictions_orig)**2
-        
+            self.predictions = jnp.maximum(0.0, self.predictions)**2
     
-
+    
     def run_inference(self, rng_key):
         '''
         helper function for doing hmc inference
@@ -386,17 +326,103 @@ class SARIX():
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
         self.samples = mcmc.get_samples()
+    
+    
+    def make_state_transition_matrix(self, theta):
+        batch_shape = theta.shape[:-1]
+        n_ar_coef = self.p + self.P * (self.p + 1)
+        
+        A_x_cols = [
+            jnp.concatenate(
+                    [
+                        jnp.zeros(batch_shape + (i * n_ar_coef, 1)),
+                        jnp.expand_dims(theta[..., (i * n_ar_coef):((i + 1) * n_ar_coef)], -1),
+                        jnp.zeros(batch_shape + ((self.n_x - i) * n_ar_coef, 1))
+                    ],
+                    axis = -2) \
+                for i in range(self.n_x)
+        ]
+        A_y_col = [ jnp.expand_dims(theta[..., (self.n_x * n_ar_coef):], -1) ]
+        # A_x_cols = [
+        #     jnp.concatenate(
+        #             [
+        #                 jnp.zeros((i * n_ar_coef, 1)),
+        #                 theta[(i * n_ar_coef):((i + 1) * n_ar_coef)].reshape(n_ar_coef, 1),
+        #                 jnp.zeros(((self.n_x - i) * n_ar_coef, 1))
+        #             ],
+        #             axis = 0) \
+        #         for i in range(self.n_x)
+        # ]
+        # A_y_col = [ theta[(self.n_x * n_ar_coef):].reshape((1 + self.n_x) * n_ar_coef, 1) ]
+        
+        A = jnp.concatenate(A_x_cols + A_y_col, axis = -1)
+        
+        return A
+    
+    
+    def state_update_X(self, init_stoch_state, stoch_state):
+        stoch_state = jnp.concatenate([init_stoch_state, stoch_state], axis=-2)
+        
+        # lagged values of x
+        lagged_x = [
+            self.build_lagged_var(stoch_state[..., :, i:(i+1)]) \
+                for i in range(self.n_x)
+        ]
+        
+        # lagged values of y
+        lagged_y = self.build_lagged_var(stoch_state[..., :, self.n_x:(self.n_x + 1)])
+        
+        # concatenate
+        return jnp.concatenate(lagged_x + [lagged_y], axis = -1)
+    
+    
+    def build_lagged_var(self, x):
+        # lagged state, highest degree term
+        lagged_state = [
+            self.lagged_vals_one_seasonal_lag(x=x,
+                                              seasonal_lag=P_ind*self.season_period,
+                                              p=self.p) for P_ind in range(self.P+1)]
+        lagged_state = [x for x in lagged_state if x is not None]
+        lagged_state = jnp.concatenate(lagged_state, axis = -1)
+        
+        # return entries in rows starting at the last row of init_stoch_shape,
+        # going up to second-to-last column. These are the entries used to determine
+        # means for stoch_state
+        return lagged_state[..., (self.max_lag - 1):(-1), :]
+    
+    
+    def lagged_vals_one_seasonal_lag(self, x, seasonal_lag, p):
+        if seasonal_lag == 0:
+            # no seasonal lag, just terms up to p
+            to_concat = [self.lagged_col(x, l) for l in range(p)]
+        else:
+            # lags from seasonal_lag to (seasonal_lag + p)
+            to_concat = [self.lagged_col(x, seasonal_lag - 1 + l) for l in range(p+1)]
 
+        if to_concat == []:
+            return None
+        
+        result = jnp.concatenate(to_concat, axis=-1)
+        return result
+    
+    
+    def lagged_col(self, x, lag):
+        batch_shape = x.shape[:-2]
+        T = x.shape[-2]
+        return jnp.concatenate(
+            [jnp.full(batch_shape + (lag, 1), jnp.nan), x[..., :(T-lag), 0:1]],
+            axis=-2)
+    
     
     def model(self, xy):
         ## Vector of variances for each of the 2 state variables
-        ar_update_sd = numpyro.sample("betas_update_var", dist.HalfCauchy(jnp.ones(self.n_x + 1)))
-
+        ar_update_sd = numpyro.sample("ar_update_sd", dist.HalfCauchy(jnp.ones(self.n_x + 1)))
+        
         ## Lower cholesky factor of the covariance matrix
         ## we can also use a faster formula `Sigma_eta_chol = sigma[..., None] * L_sigma_eta`
         # Sigma_eta_chol = jnp.matmul(jnp.diag(sigma), L_sigma_eta)
         Sigma_ar_update_chol = jnp.diag(ar_update_sd)
-
+        
         # state transition matrix parameters
         n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
         theta_sd = numpyro.sample(
@@ -407,79 +433,102 @@ class SARIX():
             "theta",
             dist.Normal(loc=jnp.zeros(n_theta), scale=jnp.full((n_theta,), theta_sd))
         )
-
-        max_lag = self.p + self.P * self.season_period
-        betas = numpyro.sample(
-            "xy",
-            SARProcess(
-                n_x=self.n_x,
-                p=self.p,
-                P=self.P,
-                season_period=self.season_period,
-                init_state=xy[:max_lag, :],
-                theta=theta,
-                noise_distribution=dist.MultivariateNormal(
-                    loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
-                num_steps=xy.shape[0] - max_lag
-            ),
-            obs = xy[max_lag:, :]
-        )
         
-        # predict future values
-        numpyro.sample(
-            "xy_future",
-            SARProcess(
-                n_x=self.n_x,
-                p=self.p,
-                P=self.P,
-                season_period=self.season_period,
-                init_state=xy[-max_lag:, :],
-                theta=theta,
-                noise_distribution=dist.MultivariateNormal(
-                    loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
-                num_steps=self.forecast_horizon
-            )
+        # assemble state transition matrix A
+        A = self.make_state_transition_matrix(theta)
+        
+        # calculate innovations
+        step_means = jnp.matmul(
+            self.update_X,
+            A
         )
-
-
+        # assert(step_means.shape == (xy.shape[0] - self.max_lag, xy.shape[1]))
+        # step innovations are (state - step_means),
+        # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
+        # step_innovations = value[..., 1:] - step_means
+        step_innovations = xy[self.max_lag:, :] - step_means
+        
+        # sample innovations
+        numpyro.sample(
+            "step_innovations",
+            dist.MultivariateNormal(
+                loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
+            obs = step_innovations
+        )
+    
+    
+    def predict(self, rng_key):
+        '''
+        Predict future values of all signals based on a single sample of
+        parameter values from the posterior distribution.
+        '''
+        # load in parameter estimates
+        theta = self.samples['theta']
+        batch_shape = theta.shape[:-1]
+        A = self.make_state_transition_matrix(theta)
+        ar_update_sd = self.samples['ar_update_sd']
+        # convert ar_update_sd to a batch of covariance matrices
+        Sigma_ar_update_chol = jnp.expand_dims(ar_update_sd, -2) * \
+            jnp.eye(ar_update_sd.shape[-1])
+        
+        # generate innovations
+        # note that the use of sample_shape = forecast_horizon means that
+        # innovations.shape = (forecast_horizon,) + batch_shape + (n_x + 1)
+        # we would really like shape batch_shape + (forecast_horizon, n_x + 1)
+        # we deal with this in the loop below when adding to the mean for each
+        # forecast horizon by dropping the leading dimension when indexing, then
+        # inserting an extra dimension at position -2 before adding.
+        innovations = dist.MultivariateNormal(
+                loc=jnp.zeros((self.n_x + 1,)),
+                scale_tril=Sigma_ar_update_chol) \
+            .sample(rng_key, sample_shape=(self.forecast_horizon, ))
+        
+        # generate step-ahead forecasts iteratively
+        y_pred = []
+        recent_lags = jnp.broadcast_to(self.xy[-self.max_lag:, :],
+                                       batch_shape + (self.max_lag, self.xy.shape[-1]))
+        dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[1]))
+        for h in range(self.forecast_horizon):
+            update_X = self.state_update_X(recent_lags, dummy_values)
+            new_y_pred = jnp.matmul(update_X, A) + jnp.expand_dims(innovations[h, ...], -2)
+            y_pred.append(new_y_pred)
+            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred], axis=-2)
+        
+        y_pred = jnp.concatenate(y_pred, axis=-2)
+        return onp.asarray(y_pred)
+    
+    
     def plot(self, save_path = None):
         t = onp.arange(self.y_nbhd.shape[0])
         t_pred = onp.arange(self.y_nbhd.shape[0] + self.forecast_horizon)
         n_betas = self.samples['betas'].shape[1]
-
+        
         percentile_levels = [2.5, 97.5]
         median_prediction = onp.median(self.predictions, axis=0)
         percentiles = onp.percentile(self.predictions, percentile_levels, axis=0)
         median_prediction_orig = onp.median(self.predictions_orig, axis=0)
         percentiles_orig = onp.percentile(self.predictions_orig, percentile_levels, axis=0)
-
+        
         fig, ax = plt.subplots(n_betas + 1, 1, figsize=(10,3 * (n_betas + 1)))
-
+        
         ax[0].fill_between(t_pred, percentiles_orig[0, :], percentiles_orig[1, :], color='lightblue')
         ax[0].plot(t_pred, median_prediction_orig, 'blue', ls='solid', lw=2.0)
         ax[0].plot(t, self.y_orig, 'black', ls='solid')
         ax[0].set(xlabel="t", ylabel="y", title="Mean predictions with 95% CI")
-
+        
         # plot 95% confidence level of predictions
         ax[1].fill_between(t_pred, percentiles[0, :], percentiles[1, :], color='lightblue')
         ax[1].plot(t_pred, median_prediction, 'blue', ls='solid', lw=2.0)
         ax[1].plot(t, self.y, 'black', ls='solid')
         ax[1].set(xlabel="t", ylabel="y (" + self.transform + " scale)", title="Mean predictions with 95% CI")
-
+        
         for i in range(1, n_betas):
             beta_median = onp.median(self.samples['betas'][:, i, :], axis=0)
             beta_percentiles = onp.percentile(self.samples['betas'][:, i, :], percentile_levels, axis=0)
             ax[i + 1].fill_between(t_pred, beta_percentiles[0, :], beta_percentiles[1, :], color='lightblue')
             ax[i + 1].plot(t_pred, beta_median, 'blue', ls='solid', lw=2.0)
             ax[i + 1].set(xlabel="t", ylabel="incidence deriv " + str(i))
-
-        # if n_betas >= 3:
-        #     mean_curvature = onp.mean(self.curvatures, axis=0)
-        #     curvature_percentiles = onp.percentile(self.curvatures, percentile_levels, axis=0)
-        #     ax[3].fill_between(t_pred, curvature_percentiles[0, :], curvature_percentiles[1, :], color='lightblue')
-        #     ax[3].plot(t_pred, mean_curvature, 'blue', ls='solid', lw=2.0)
-        #     ax[3].set(xlabel="t", ylabel="curvature")
-
+        
         if save_path is not None:
             plt.savefig(save_path)
         plt.tight_layout()
