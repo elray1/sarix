@@ -11,9 +11,7 @@ from functools import reduce
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as onp
-import pandas as pd
 
-import jax
 from jax import vmap
 import jax.numpy as jnp
 import jax.random as random
@@ -25,11 +23,6 @@ from numpyro.distributions.distribution import Distribution
 from numpyro.distributions.transforms import AffineTransform, LowerCholeskyAffine
 from numpyro.infer import MCMC, NUTS
 from numpyro.distributions.util import is_prng_key, validate_sample
-
-matplotlib.use('Agg')  # noqa: E402
-
-import datetime
-import covidcast
 
 
 def diff(x, d=0, D=0, season_period=7, pad_na=False):
@@ -100,10 +93,6 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     n_vars = x.shape[-1]
     batch_shape_dx = dx.shape[:-2]
     T_dx = dx.shape[-2]
-    # print('batch_shape_x')
-    # print(batch_shape_x)
-    # print('batch_shape_dx')
-    # print(batch_shape_dx)
     
     # validate shapes
     if dx.shape[-1] != n_vars:
@@ -498,11 +487,6 @@ class SARIX():
         xy_batch_shape = self.xy.shape[:-2]
         theta_batch_shape = theta.shape[:-1]
         sigma_batch_shape = sigma.shape[:-1]
-        # param_batch_shape = jnp.broadcast_shapes(theta_batch_shape,
-        #                                          sigma_batch_shape)
-        # batch_shape = param_batch_shape + xy_batch_shape
-        # print('batch_shape')
-        # print(batch_shape)
         
         if self.theta_pooling == 'shared':
             # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
@@ -541,37 +525,21 @@ class SARIX():
                 loc=jnp.zeros((self.n_x + 1,)),
                 scale_tril=Sigma_chol) \
             .sample(rng_key, sample_shape=(self.forecast_horizon, ))
-        # print('innovations.shape')
-        # print(innovations.shape)
         
         # generate step-ahead forecasts iteratively
         y_pred = []
         recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
                                        batch_shape + (self.max_lag, self.xy.shape[-1]))
-        # print('recent_lags.shape')
-        # print(recent_lags.shape)
         dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
-        # print('dummy_values.shape')
-        # print(dummy_values.shape)
         for h in range(self.forecast_horizon):
             update_X = self.state_update_X(recent_lags, dummy_values)
-            # print('update_X.shape')
-            # print(update_X.shape)
-            # print('update_X')
-            # print(update_X[:2, ...])
             new_y_pred = jnp.matmul(update_X, A) + \
                 jnp.expand_dims(innovations[h, ...], -2)
-            # print('new_y_pred.shape')
-            # print(new_y_pred.shape)
-            # print('new_y_pred')
-            # print(new_y_pred[:2, ...])
             y_pred.append(new_y_pred)
             recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
                                           axis=-2)
         
         y_pred = jnp.concatenate(y_pred, axis=-2)
-        # print('y_pred.shape')
-        # print(y_pred.shape)
         return onp.asarray(y_pred)
     
     
