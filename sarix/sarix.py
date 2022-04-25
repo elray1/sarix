@@ -100,6 +100,10 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     n_vars = x.shape[-1]
     batch_shape_dx = dx.shape[:-2]
     T_dx = dx.shape[-2]
+    # print('batch_shape_x')
+    # print(batch_shape_x)
+    # print('batch_shape_dx')
+    # print(batch_shape_dx)
     
     # validate shapes
     if dx.shape[-1] != n_vars:
@@ -117,6 +121,7 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     
     # invert ordinary differencing
     for i in range(1, d + 1):
+        print(f'invert ordinary differencing {i}')
         x_dm1 = diff(x, d=d-i, D=D, season_period=season_period, pad_na=True)
 
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
@@ -128,6 +133,7 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     
     # invert seasonal differencing
     for i in range(1, D + 1):
+        print(f'invert seasonal differencing {i}')
         x_dm1 = diff(x, d=0, D=D-i, season_period=season_period, pad_na=True)
         
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
@@ -250,15 +256,17 @@ class SARProcess(Distribution):
 class SARIX():
     def __init__(self,
                  xy,
-                 p,
-                 d,
-                 P,
-                 D,
-                 season_period,
-                 transform,
-                 forecast_horizon,
-                 num_warmup, num_samples, num_chains):
-        self.n_x = xy.shape[1] - 1
+                 p=1,
+                 d=0,
+                 P=0,
+                 D=0,
+                 season_period=1,
+                 transform='none',
+                 theta_pooling='none',
+                 sigma_pooling='none',
+                 forecast_horizon=1,
+                 num_warmup=1000, num_samples=1000, num_chains=1):
+        self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
         self.d = d
@@ -266,11 +274,35 @@ class SARIX():
         self.D = D
         self.max_lag = p + P * season_period
         self.transform = transform
+        self.theta_pooling = theta_pooling
+        self.sigma_pooling = sigma_pooling
         self.season_period = season_period
         self.forecast_horizon = forecast_horizon
         self.num_warmup = num_warmup
         self.num_samples = num_samples
         self.num_chains = num_chains
+        
+        # set up batch shapes for parameter pooling
+        # xy has shape batch_shape + (T, n_x + 1)
+        batch_shape = xy.shape[:-2]
+        
+        if theta_pooling == 'none':
+            # separate parameters per batch
+            self.theta_batch_shape = batch_shape
+        elif theta_pooling == 'shared':
+            # no batches for theta; will broadcast to share across all batches
+            self.theta_batch_shape = ()
+        else:
+            raise ValueError("theta_pooling must be 'none' or 'shared'")
+        
+        if sigma_pooling == 'none':
+            # separate parameters per batch
+            self.sigma_batch_shape = batch_shape
+        elif sigma_pooling == 'shared':
+            # no batches for sigma; will broadcast to share across all batches
+            self.sigma_batch_shape = ()
+        else:
+            raise ValueError("sigma_pooling must be 'none' or 'shared'")
         
         # do transformation
         self.xy_orig = xy.copy()
@@ -290,8 +322,8 @@ class SARIX():
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
         
         # pre-calculate state update matrix
-        self.update_X = self.state_update_X(self.xy[:self.max_lag, :],
-                                            self.xy[self.max_lag:, :])
+        self.update_X = self.state_update_X(self.xy[..., :self.max_lag, :],
+                                            self.xy[..., self.max_lag:, :])
         
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
@@ -343,17 +375,6 @@ class SARIX():
                 for i in range(self.n_x)
         ]
         A_y_col = [ jnp.expand_dims(theta[..., (self.n_x * n_ar_coef):], -1) ]
-        # A_x_cols = [
-        #     jnp.concatenate(
-        #             [
-        #                 jnp.zeros((i * n_ar_coef, 1)),
-        #                 theta[(i * n_ar_coef):((i + 1) * n_ar_coef)].reshape(n_ar_coef, 1),
-        #                 jnp.zeros(((self.n_x - i) * n_ar_coef, 1))
-        #             ],
-        #             axis = 0) \
-        #         for i in range(self.n_x)
-        # ]
-        # A_y_col = [ theta[(self.n_x * n_ar_coef):].reshape((1 + self.n_x) * n_ar_coef, 1) ]
         
         A = jnp.concatenate(A_x_cols + A_y_col, axis = -1)
         
@@ -415,13 +436,21 @@ class SARIX():
     
     
     def model(self, xy):
-        ## Vector of variances for each of the 2 state variables
-        ar_update_sd = numpyro.sample("ar_update_sd", dist.HalfCauchy(jnp.ones(self.n_x + 1)))
+        # Vector of innovation standard deviations for the n_x + 1 variables
+        sigma = numpyro.sample(
+            "sigma",
+            dist.HalfCauchy(jnp.ones(self.sigma_batch_shape + (self.n_x + 1,))))
         
-        ## Lower cholesky factor of the covariance matrix
-        ## we can also use a faster formula `Sigma_eta_chol = sigma[..., None] * L_sigma_eta`
-        # Sigma_eta_chol = jnp.matmul(jnp.diag(sigma), L_sigma_eta)
-        Sigma_ar_update_chol = jnp.diag(ar_update_sd)
+        # Lower cholesky factor of the covariance matrix has
+        # standard deviations on the diagonal
+        # The first line below creates (potentially batched) diagonal matrices
+        # with shape self.sigma_batch_shape + (n_x + 1, n_x + 1)
+        # If xy has batch dimensions, we then insert another dimension at
+        # postion -3 for appropriate broadcasting with the time dimension of
+        # observed values
+        Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
+        if len(xy.shape) > 2:
+            Sigma_chol = jnp.expand_dims(Sigma_chol, -3)
         
         # state transition matrix parameters
         n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
@@ -431,29 +460,30 @@ class SARIX():
         )
         theta = numpyro.sample(
             "theta",
-            dist.Normal(loc=jnp.zeros(n_theta), scale=jnp.full((n_theta,), theta_sd))
+            dist.Normal(loc=jnp.zeros(self.theta_batch_shape + (n_theta,)),
+                        scale=jnp.full(self.theta_batch_shape + (n_theta,),
+                                       theta_sd))
         )
         
         # assemble state transition matrix A
         A = self.make_state_transition_matrix(theta)
         
-        # calculate innovations
+        # predictive means based on AR structure
         step_means = jnp.matmul(
             self.update_X,
             A
         )
-        # assert(step_means.shape == (xy.shape[0] - self.max_lag, xy.shape[1]))
+        
         # step innovations are (state - step_means),
-        # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
-        # step_innovations = value[..., 1:] - step_means
-        step_innovations = xy[self.max_lag:, :] - step_means
+        # with shape (batch_shape, T - self.max_lag, n_x + 1)
+        step_innovations = xy[..., self.max_lag:, :] - step_means
         
         # sample innovations
         numpyro.sample(
             "step_innovations",
             dist.MultivariateNormal(
-                loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_ar_update_chol),
-            obs = step_innovations
+                loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_chol),
+            obs=step_innovations
         )
     
     
@@ -462,14 +492,43 @@ class SARIX():
         Predict future values of all signals based on a single sample of
         parameter values from the posterior distribution.
         '''
-        # load in parameter estimates
+        # load in parameter estimates and update to target batch size
         theta = self.samples['theta']
+        sigma = self.samples['sigma']
+        xy_batch_shape = self.xy.shape[:-2]
+        theta_batch_shape = theta.shape[:-1]
+        sigma_batch_shape = sigma.shape[:-1]
+        # param_batch_shape = jnp.broadcast_shapes(theta_batch_shape,
+        #                                          sigma_batch_shape)
+        # batch_shape = param_batch_shape + xy_batch_shape
+        # print('batch_shape')
+        # print(batch_shape)
+        
+        if self.theta_pooling == 'shared':
+            # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
+            # first insert 1's corresponding to xy_batch_shape, then broadcast
+            ones = (1,) * len(xy_batch_shape)
+            theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
+            theta = jnp.broadcast_to(theta,
+                                     theta_batch_shape + xy_batch_shape + \
+                                         (theta.shape[-1],))
+        
+        if self.sigma_pooling == 'shared':
+            # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
+            # first insert 1's corresponding to xy_batch_shape, then broadcast
+            ones = (1,) * len(xy_batch_shape)
+            sigma = theta.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
+            sigma = jnp.broadcast_to(sigma,
+                                     sigma_batch_shape + xy_batch_shape + \
+                                         (sigma.shape[-1],))
+        
         batch_shape = theta.shape[:-1]
+        
+        # state transition matrix
         A = self.make_state_transition_matrix(theta)
-        ar_update_sd = self.samples['ar_update_sd']
-        # convert ar_update_sd to a batch of covariance matrices
-        Sigma_ar_update_chol = jnp.expand_dims(ar_update_sd, -2) * \
-            jnp.eye(ar_update_sd.shape[-1])
+        
+        # convert sigma to a batch of covariance matrix Cholesky factors
+        Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
         
         # generate innovations
         # note that the use of sample_shape = forecast_horizon means that
@@ -480,21 +539,39 @@ class SARIX():
         # inserting an extra dimension at position -2 before adding.
         innovations = dist.MultivariateNormal(
                 loc=jnp.zeros((self.n_x + 1,)),
-                scale_tril=Sigma_ar_update_chol) \
+                scale_tril=Sigma_chol) \
             .sample(rng_key, sample_shape=(self.forecast_horizon, ))
+        # print('innovations.shape')
+        # print(innovations.shape)
         
         # generate step-ahead forecasts iteratively
         y_pred = []
-        recent_lags = jnp.broadcast_to(self.xy[-self.max_lag:, :],
+        recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
                                        batch_shape + (self.max_lag, self.xy.shape[-1]))
-        dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[1]))
+        # print('recent_lags.shape')
+        # print(recent_lags.shape)
+        dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
+        # print('dummy_values.shape')
+        # print(dummy_values.shape)
         for h in range(self.forecast_horizon):
             update_X = self.state_update_X(recent_lags, dummy_values)
-            new_y_pred = jnp.matmul(update_X, A) + jnp.expand_dims(innovations[h, ...], -2)
+            # print('update_X.shape')
+            # print(update_X.shape)
+            # print('update_X')
+            # print(update_X[:2, ...])
+            new_y_pred = jnp.matmul(update_X, A) + \
+                jnp.expand_dims(innovations[h, ...], -2)
+            # print('new_y_pred.shape')
+            # print(new_y_pred.shape)
+            # print('new_y_pred')
+            # print(new_y_pred[:2, ...])
             y_pred.append(new_y_pred)
-            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred], axis=-2)
+            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
+                                          axis=-2)
         
         y_pred = jnp.concatenate(y_pred, axis=-2)
+        # print('y_pred.shape')
+        # print(y_pred.shape)
         return onp.asarray(y_pred)
     
     
