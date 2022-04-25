@@ -110,7 +110,6 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     
     # invert ordinary differencing
     for i in range(1, d + 1):
-        print(f'invert ordinary differencing {i}')
         x_dm1 = diff(x, d=d-i, D=D, season_period=season_period, pad_na=True)
 
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
@@ -122,7 +121,6 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     
     # invert seasonal differencing
     for i in range(1, D + 1):
-        print(f'invert seasonal differencing {i}')
         x_dm1 = diff(x, d=0, D=D-i, season_period=season_period, pad_na=True)
         
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
