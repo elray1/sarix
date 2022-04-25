@@ -458,10 +458,7 @@ class SARIX():
         A = self.make_state_transition_matrix(theta)
         
         # predictive means based on AR structure
-        step_means = jnp.matmul(
-            self.update_X,
-            A
-        )
+        step_means = jnp.matmul(self.update_X, A)
         
         # step innovations are (state - step_means),
         # with shape (batch_shape, T - self.max_lag, n_x + 1)
@@ -493,18 +490,16 @@ class SARIX():
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
             theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
-            theta = jnp.broadcast_to(theta,
-                                     theta_batch_shape + xy_batch_shape + \
-                                         (theta.shape[-1],))
+            target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
+            theta = jnp.broadcast_to(theta, target)
         
         if self.sigma_pooling == 'shared':
             # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
             sigma = theta.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
-            sigma = jnp.broadcast_to(sigma,
-                                     sigma_batch_shape + xy_batch_shape + \
-                                         (sigma.shape[-1],))
+            target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
+            sigma = jnp.broadcast_to(sigma, target)
         
         batch_shape = theta.shape[:-1]
         
