@@ -315,14 +315,17 @@ class SARIX():
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
         self.run_inference(rng_key)
+        print('in sarix, returned from self.run_inference; calling self.predict')
         
         # generate predictions
         self.predictions_modeled_scale = self.predict(rng_key_predict)
+        print('in sarix, returned from self.predict')
         
         # undo differencing
         self.predictions = inv_diff(transformed_xy,
                                     self.predictions_modeled_scale,
                                     self.d, self.D, self.season_period)
+        print('in sarix, returned from inv_diff')
         
         # undo transformation to get predictions on original scale
         if transform == "log":
@@ -533,6 +536,7 @@ class SARIX():
                                           axis=-2)
         
         y_pred = jnp.concatenate(y_pred, axis=-2)
+        print('in SARIX.predict, about to convert to onp and return')
         return onp.asarray(y_pred)
     
     
