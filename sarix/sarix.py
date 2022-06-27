@@ -347,7 +347,9 @@ class SARIX():
         mcmc.run(rng_key, self.xy, init_params={})
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
+        print('extracting mcmc samples')
         self.samples = mcmc.get_samples()
+        print('got mcmc samples')
     
     
     def make_state_transition_matrix(self, theta):
