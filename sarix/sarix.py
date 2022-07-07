@@ -482,13 +482,15 @@ class SARIX():
         parameter values from the posterior distribution.
         '''
         # load in parameter estimates and update to target batch size
+        print('in sarix.predict, extracting mcmc samples')
         theta = self.samples['theta']
         sigma = self.samples['sigma']
         xy_batch_shape = self.xy.shape[:-2]
         theta_batch_shape = theta.shape[:-1]
         sigma_batch_shape = sigma.shape[:-1]
-        
+
         if self.theta_pooling == 'shared':
+            print('in sarix.predict, handle shared theta pooling')
             # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
@@ -497,6 +499,7 @@ class SARIX():
             theta = jnp.broadcast_to(theta, target)
         
         if self.sigma_pooling == 'shared':
+            print('in sarix.predict, handle shared sigma pooling')
             # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
@@ -507,9 +510,11 @@ class SARIX():
         batch_shape = theta.shape[:-1]
         
         # state transition matrix
+        print('in sarix.predict, make state transition matrix')
         A = self.make_state_transition_matrix(theta)
         
         # convert sigma to a batch of covariance matrix Cholesky factors
+        print('in sarix.predict, Sigma batching')
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
         
         # generate innovations
@@ -519,24 +524,31 @@ class SARIX():
         # we deal with this in the loop below when adding to the mean for each
         # forecast horizon by dropping the leading dimension when indexing, then
         # inserting an extra dimension at position -2 before adding.
+        print('in sarix.predict, generate innovations')
         innovations = dist.MultivariateNormal(
                 loc=jnp.zeros((self.n_x + 1,)),
                 scale_tril=Sigma_chol) \
             .sample(rng_key, sample_shape=(self.forecast_horizon, ))
         
         # generate step-ahead forecasts iteratively
+        print('in sarix.predict, generate step-ahead forecasts')
         y_pred = []
         recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
                                        batch_shape + (self.max_lag, self.xy.shape[-1]))
         dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
         for h in range(self.forecast_horizon):
+            print(f'in sarix.predict, simulation loop h={h}')
             update_X = self.state_update_X(recent_lags, dummy_values)
+            print(f'in sarix.predict, simulation loop h={h} new_y_pred')
             new_y_pred = jnp.matmul(update_X, A) + \
                 jnp.expand_dims(innovations[h, ...], -2)
+            print(f'in sarix.predict, simulation loop h={h} append')
             y_pred.append(new_y_pred)
+            print(f'in sarix.predict, simulation loop h={h} concatenate')
             recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
                                           axis=-2)
         
+        print(f'in sarix.predict, after simulation concatenate')
         y_pred = jnp.concatenate(y_pred, axis=-2)
         print('in SARIX.predict, about to convert to onp and return')
         return onp.asarray(y_pred)
