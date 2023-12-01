@@ -238,7 +238,6 @@ class SARIX():
         mcmc.run(rng_key, self.xy)
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
-        print()
         self.samples = mcmc.get_samples()
     
     
