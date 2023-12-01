@@ -291,6 +291,11 @@ class SARIX():
         else:
             raise ValueError("sigma_pooling must be 'none' or 'shared'")
         
+        print('theta_batch_shape')
+        print(self.theta_batch_shape)
+        print('sigma_batch_shape')
+        print(self.sigma_batch_shape)
+        
         # do transformation
         self.xy_orig = xy.copy()
         if transform == "sqrt":
@@ -314,15 +319,21 @@ class SARIX():
         
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
+        print('calling run_inference')
         self.run_inference(rng_key)
+        print('exited run_inference')
         
         # generate predictions
+        print('calling predict')
         self.predictions_modeled_scale = self.predict(rng_key_predict)
+        print('exited predict')
         
         # undo differencing
+        print('calling inv_diff')
         self.predictions = inv_diff(transformed_xy,
                                     self.predictions_modeled_scale,
                                     self.d, self.D, self.season_period)
+        print('exited inv_diff')
         
         # undo transformation to get predictions on original scale
         if transform == "log":
@@ -341,9 +352,12 @@ class SARIX():
         kernel = NUTS(self.model)
         mcmc = MCMC(kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, num_chains=self.num_chains,
                     progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
+        print('calling mcmc.run')
         mcmc.run(rng_key, self.xy, init_params={})
+        print('exited mcmc.run')
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
+        print()
         self.samples = mcmc.get_samples()
     
     
@@ -427,6 +441,8 @@ class SARIX():
         sigma = numpyro.sample(
             "sigma",
             dist.HalfCauchy(jnp.ones(self.sigma_batch_shape + (self.n_x + 1,))))
+        print('sigma shape')
+        print(sigma.shape)
         
         # Lower cholesky factor of the covariance matrix has
         # standard deviations on the diagonal
@@ -438,6 +454,9 @@ class SARIX():
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
         if len(xy.shape) > 2:
             Sigma_chol = jnp.expand_dims(Sigma_chol, -3)
+        
+        print('Sigma_chol shape')
+        print(Sigma_chol.shape)
         
         # state transition matrix parameters
         n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
@@ -451,6 +470,8 @@ class SARIX():
                         scale=jnp.full(self.theta_batch_shape + (n_theta,),
                                        theta_sd))
         )
+        print('theta shape')
+        print(theta.shape)
         
         # assemble state transition matrix A
         A = self.make_state_transition_matrix(theta)
@@ -461,6 +482,8 @@ class SARIX():
         # step innovations are (state - step_means),
         # with shape (batch_shape, T - self.max_lag, n_x + 1)
         step_innovations = xy[..., self.max_lag:, :] - step_means
+        print('step_innovations shape')
+        print(step_innovations.shape)
         
         # sample innovations
         numpyro.sample(
