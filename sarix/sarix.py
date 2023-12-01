@@ -352,7 +352,7 @@ class SARIX():
         kernel = NUTS(self.model)
         mcmc = MCMC(kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, num_chains=self.num_chains,
                     progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
-        print('calling mcmc.run')
+        print('calling mcmc.run, no inits')
         mcmc.run(rng_key, self.xy)
         print('exited mcmc.run')
         mcmc.print_summary()
