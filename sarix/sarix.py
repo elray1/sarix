@@ -133,112 +133,6 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
     return dx
 
 
-class SARProcess(Distribution):
-    # arg_constraints = {"scale": constraints.positive}
-    arg_constraints = {}
-    support = constraints.real_vector
-    # reparametrized_params = ["scale"]
-    reparametrized_params = []
-
-    def __init__(self,
-                 n_x=0,
-                 p=1,
-                 P=0,
-                 season_period=7,
-                 init_state=jnp.array([[[0.0]]]),
-                 update_X=jnp.array([[1.0]]),
-                 theta=jnp.array([1.0]),
-                 noise_distribution=dist.MultivariateNormal(loc=jnp.zeros((1,)), covariance_matrix=jnp.eye(1)),
-                 num_steps=1,
-                 validate_args=None):
-        """
-        Parameters
-        ----------
-        n_x: integer number of x covariates
-        p: integer number of non-seasonal lags to include
-        P: integer number of seasonal lags to include
-        season_period: integer length of seasonal period; e.g., 7 for weekly data
-        init_state: the value of the state at time 0. an array of shape (batch_shape, n_states, 1)
-        theta: parameter vector of length (1 + 2*n_x) * (p + P * (p + 1))
-        noise_distribution: distribution for state transition noise, with event shape `n_x + 1`.
-            The state at time t, X_t, is computed as X_t = np.matmul(A, X_{t-1}) + epsilon_t,
-            where epsilon_t ~ noise_distribution
-        num_steps: number of steps the process iterates for.  If num_steps is 1, all values will
-            be the value of the initial state
-        """
-        assert (
-            num_steps > 0
-        ), "`num_steps` argument should be an positive integer."
-        assert (
-            len(theta) == (1 + 2 * n_x) * (p + P * (p + 1))
-        ), "`theta` argument should have length (1 + 2 * n_x) * (p + P * (p + 1))"
-        self.n_x = n_x
-        self.num_states = n_x + 1
-        
-        self.p = p
-        self.P = P
-        self.season_period = season_period
-        self.max_lag = p + P * season_period
-        
-        self.init_state = init_state
-        self.update_X = update_X
-        
-        self.noise_distribution = noise_distribution
-        
-        self.theta = theta
-        
-        self.num_steps = num_steps
-        
-        batch_shape, event_shape = (), (num_steps, self.num_states)
-        
-        # assemble state transition matrix A
-        n_ar_coef = p + P * (p + 1)
-        A_x_cols = [
-            jnp.concatenate(
-                    [
-                        jnp.zeros((i * n_ar_coef, 1)),
-                        theta[(i * n_ar_coef):((i + 1) * n_ar_coef)].reshape(n_ar_coef, 1),
-                        jnp.zeros(((n_x - i) * n_ar_coef, 1))
-                    ],
-                    axis = 0) \
-                for i in range(n_x)
-        ]
-        A_y_col = [ theta[(n_x * n_ar_coef):].reshape((1 + n_x) * n_ar_coef, 1) ]
-        self.A = jnp.concatenate(A_x_cols + A_y_col, axis = 1)
-        
-        super(SARProcess, self).__init__(
-            batch_shape, event_shape, validate_args=validate_args
-        )
-    
-    
-    @validate_sample
-    def log_prob(self, value):
-        # step means are np.matmul(X, A) for states before time t,
-        # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
-        # update_X = self.state_update_X(self.init_state, value)
-        update_X = self.update_X
-        step_means = jnp.matmul(
-            update_X,
-            self.A
-        )
-        assert(step_means.shape == (self.num_steps, self.n_x + 1))
-        # step innovations are (state - step_means),
-        # with shape (sample_shape, batch_shape, num_states, num_steps - 1)
-        # step_innovations = value[..., 1:] - step_means
-        step_innovations = value - step_means
-        step_probs = self.noise_distribution.log_prob(step_innovations)
-        return jnp.sum(step_probs, axis=-1)
-    
-    
-    def tree_flatten(self):
-        return (self.scale,), self.num_steps
-    
-    
-    @classmethod
-    def tree_unflatten(cls, aux_data, params):
-        return cls(*params, num_steps=aux_data)
-
-
 
 class SARIX():
     def __init__(self,
@@ -341,7 +235,7 @@ class SARIX():
         kernel = NUTS(self.model)
         mcmc = MCMC(kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, num_chains=self.num_chains,
                     progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
-        mcmc.run(rng_key, self.xy, init_params={})
+        mcmc.run(rng_key, self.xy)
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
         self.samples = mcmc.get_samples()
