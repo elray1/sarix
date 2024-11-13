@@ -14,7 +14,6 @@ setup(name='sarix',
         'matplotlib',
         'pandas',
         'numpyro',
-        'jax',
-        'covidcast'
+        'jax'
     ],
 )
