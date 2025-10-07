@@ -389,7 +389,7 @@ class SARIX():
             # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
-            sigma = theta.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
+            sigma = sigma.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
             target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
             sigma = jnp.broadcast_to(sigma, target)
         
